@@ -842,7 +842,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
     // Publish real-frame accounting to the overlay shared-memory block. One
     // guest present == one real frame (generated-frame accounting is added
     // separately on the successful 2x-insert path below).
-    winfg_stats::account(1, 0, en != 0, (uint32_t)st->cfg.multiplier, t_entry);
+    winfg_stats::account(1, 0, en != 0, (uint32_t)st->cfg.multiplier, mono_ns());
     WFG_LOGD(dbg, "P#%llu present-enter: enabled=%d mult=%d fg.valid=%d capture=%d swapCount=%u",
              presents, en, st->cfg.multiplier, st->fg.valid() ? 1 : 0,
              st->cfg.capture ? 1 : 0, pPresentInfo->swapchainCount);

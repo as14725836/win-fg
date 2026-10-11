@@ -52,6 +52,12 @@ struct Stats {
 // Returns nullptr if the shm could not be created (non-fatal: FG still works,
 // the overlay simply won't see win-fg stats).
 Stats* ensure() {
+    // Android's Bionic libc has no POSIX shm (shm_open/shm_unlink are absent),
+    // so the overlay stats publisher is disabled on native Android NDK builds.
+    // termux-glibc / desktop glibc builds (the real MangoHud target) keep it.
+#ifdef __ANDROID__
+    return nullptr;
+#else
     static Stats* s = nullptr;
     if (s) return s;
 
@@ -69,7 +75,7 @@ Stats* ensure() {
         char path[512];
         std::snprintf(path, sizeof(path), "%s/%s", dir, name);
         fd = open(path, O_RDWR | O_CREAT, 0600);
-        if (fd >= 0) std::fchmod(fd, 0600);
+        if (fd >= 0) ::fchmod(fd, 0600);
     } else {
         fd = shm_open(name, O_RDWR | O_CREAT, 0600);
     }
@@ -105,6 +111,7 @@ Stats* ensure() {
     s->enabled     = 0;
     s->multiplier  = 0;
     return s;
+#endif // __ANDROID__
 }
 
 // Call from the present hook. `real` and `gen` are deltas since the last call
