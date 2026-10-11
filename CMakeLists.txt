@@ -30,7 +30,14 @@ configure_file(${CMAKE_SOURCE_DIR}/src/version_stamp.cpp.in
 add_library(win_fg SHARED src/layer.cpp src/framegen.cpp
             ${CMAKE_BINARY_DIR}/version_stamp.cpp)
 target_include_directories(win_fg PRIVATE src ${VULKAN_INCLUDE})
-target_compile_definitions(win_fg PRIVATE VK_NO_PROTOTYPES=1 VK_USE_PLATFORM_ANDROID_KHR)
+target_compile_definitions(win_fg PRIVATE VK_NO_PROTOTYPES=1)
+if(ANDROID)
+  # Android-specific Vulkan platform header (vulkan_android.h needs NDK types
+  # like AHardwareBuffer). Only defined when actually cross-compiling with the
+  # NDK; termux-glibc / desktop glibc builds stay platform-neutral and use the
+  # software (non-GL) Vulkan path.
+  target_compile_definitions(win_fg PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
+endif()
 set_target_properties(win_fg PROPERTIES OUTPUT_NAME win_fg)
 if(ANDROID)
   find_library(log-lib log)
