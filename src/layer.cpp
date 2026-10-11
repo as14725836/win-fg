@@ -7,6 +7,7 @@
 #include "config.hpp"
 #include "capture.hpp"
 #include "log.hpp"
+#include "winfg_stats.hpp"
 #include <vulkan/vk_layer.h>
 #include <map>
 #include <mutex>
@@ -838,6 +839,10 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
         lastEnabled = en;
     }
     ++presents;
+    // Publish real-frame accounting to the overlay shared-memory block. One
+    // guest present == one real frame (generated-frame accounting is added
+    // separately on the successful 2x-insert path below).
+    winfg_stats::account(1, 0, en != 0, (uint32_t)st->cfg.multiplier, t_entry);
     WFG_LOGD(dbg, "P#%llu present-enter: enabled=%d mult=%d fg.valid=%d capture=%d swapCount=%u",
              presents, en, st->cfg.multiplier, st->fg.valid() ? 1 : 0,
              st->cfg.capture ? 1 : 0, pPresentInfo->swapchainCount);
@@ -1127,6 +1132,9 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 VkResult pg = presentOne(fc.genSem, spareIdx, nullptr);   // generated frame: NEVER carry a present-id (may be skipped)
                 uint64_t tGenDone = mono_ns();
                 WFG_LOGD(dbg, "P#%llu present-generated DONE r=%d", presents, (int)pg);
+                // A generated frame was actually inserted this present — account it
+                // so the overlay can show real -> real+generated (e.g. 60 -> 120).
+                winfg_stats::account(0, 1, en != 0, (uint32_t)st->cfg.multiplier, tGenDone);
 
                 // (b) REAL present. Hold to the scheduled beat so gen↔real end up
                 //     ~dt/2 apart; skip the wait cleanly if already late.
