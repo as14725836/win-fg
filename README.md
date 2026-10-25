@@ -302,6 +302,23 @@ cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
 cmake --build .
 ```
 
+### Building against the termux **glibc** toolchain
+
+The `glibc-packages` packages ship a build that is *not* bionic. The glibc
+prefix ships gcc/as/ld but no cmake/ninja, so the stages are driven by hand:
+
+```
+./tools/build_shaders.sh                    # must run first: embeds SPIR-V
+./tools/build_glibc_termux.sh               # → build/glibc/libwin_fg.so
+strings build/glibc/libwin_fg.so | grep win-fg-build   # verify the stamp
+```
+
+Override the prefix with `WINFG_GLIBC_PREFIX` if it is not
+`/data/data/com.termux/files/usr/glibc`. Never export the prefix on
+`LD_LIBRARY_PATH` in your shell — the script runs every tool through the glibc
+loader explicitly, and a leaked prefix breaks host binaries (and makes
+`tar xzOf` insist an xz stream is not gzip).
+
 Every CI build stamps `git describe` into the binary, and the build **fails** if
 the stamp is missing. To recover which commit a `.so` in the wild came from:
 
