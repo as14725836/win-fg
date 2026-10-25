@@ -365,8 +365,16 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     wImg(dd_, device_, g_scratch.sSynth, 33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, currView, linear_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     wImg(dd_, device_, g_scratch.sSynth, 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, outView, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
 
+    // Pipeline-bind cache: consecutive disp() calls usually share the same Pipe
+    // (luma x2, downsample x6, prewarp x5, flow x5), so rebinding every time is
+    // pure driver overhead. Every direct CmdBindPipeline below must update
+    // boundPipe so this cache stays honest.
+    VkPipeline boundPipe = VK_NULL_HANDLE;
     auto disp = [&](const Pipe& p, VkDescriptorSet set, VkExtent2D e) {
-        dd_->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+        if (boundPipe != p.pipeline) {
+            dd_->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+            boundPipe = p.pipeline;
+        }
         dd_->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
         dd_->CmdDispatch(cmd, (e.width + 15) / 16, (e.height + 15) / 16, 1);
     };
@@ -376,14 +384,47 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     // discard-transition them all to GENERAL up front (all descriptors use GENERAL
     // for these). This also fixes the first-frame layout (storage writes require
     // GENERAL, not UNDEFINED).
-    for (auto& i : pyrA_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    for (auto& i : pyrB_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    for (int l = flowFinest_; l < kLevels; ++l) barrier(cmd, pyrAs_[l].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    barrier(cmd, flowExpA_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    barrier(cmd, flowExpB_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    // C2: ping-pong scratch to GENERAL (storage writes require it; contents discarded).
-    barrier(cmd, flowRegA_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    barrier(cmd, flowRegB_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    // Same set of images, but batched into ONE CmdPipelineBarrier instead of ~23
+    // separate calls (each call is a driver vkCmd* entry point + validation cost
+    // even though the GPU work is identical). Stage/access masks are copied
+    // verbatim from FrameGen::barrier()'s COMPUTE->COMPUTE pairing: the oldLayout
+    // is UNDEFINED (contents discarded) so srcAccess is a no-op for visibility,
+    // but the COMPUTE stage still gives us the execution dependency that keeps
+    // this frame's writes ordered after the previous frame's.
+    {
+        std::vector<VkImageMemoryBarrier> ib;
+        ib.reserve(pyrA_.size() + pyrB_.size() + flowLvl_.size() + 6);
+        auto add = [&](VkImage img) {
+            if (img == VK_NULL_HANDLE) return;
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = img;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            ib.push_back(b);
+        };
+        for (auto& i : pyrA_) add(i.image);
+        for (auto& i : pyrB_) add(i.image);
+        for (int l = flowFinest_; l < kLevels; ++l) add(pyrAs_[l].image);
+        // flowLvl_ needs GENERAL for imageStore on the first frame. The coarsest
+        // level is excluded here because the clear loop below takes it through
+        // TRANSFER_DST_OPTIMAL -> GENERAL itself (one transition, not two).
+        for (int l = flowFinest_; l < kLevels - 1; ++l) add(flowLvl_[l].image);
+        add(flowExpA_.image);
+        add(flowExpB_.image);
+        // C2: ping-pong scratch to GENERAL (storage writes require it; contents discarded).
+        add(flowRegA_.image);
+        add(flowRegB_.image);
+        if (!ib.empty()) {
+            dd_->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                    0, nullptr, 0, nullptr,
+                                    (uint32_t)ib.size(), ib.data());
+        }
+    }
     // Reset the flow field to zero every frame. The coarsest level uses it as its
     // search predictor; carrying it across frames lets a spurious vector feed
     // forward until it diverges and melts the image (the bg/fg pause was resetting
@@ -392,7 +433,11 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     {
         VkClearColorValue zero{};
         VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        for (int l = flowFinest_; l < kLevels; ++l) {
+        // Only the COARSEST level reads its own previous content as the search
+        // predictor (pred = l+1 < kLevels ? l+1 : l). Every finer level is fully
+        // overwritten by its own dispatch before anyone reads it, so zeroing
+        // them is 6 wasted clears + 12 wasted barriers per frame.
+        for (int l = kLevels - 1; l < kLevels; ++l) {
             VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             b.srcAccessMask = 0; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -422,6 +467,7 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     //     happens when this slot comes round again (~1-2 frames later).
     if (gmBuffersReady_ && g_scratch.sGmReduce[gmSlot]) {
         dd_->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pGmReduce_.pipeline);
+        boundPipe = pGmReduce_.pipeline;
         dd_->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pGmReduce_.layout, 0, 1, &g_scratch.sGmReduce[gmSlot], 0, nullptr);
         dd_->CmdDispatch(cmd, (uint32_t)(kGmThreads / 64), 1, 1);
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -466,6 +512,7 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
             else if (it % 2 == 1)  { set = g_scratch.sFlowRegAB; outImg = &flowRegB_; }
             else                   { set = g_scratch.sFlowRegBA; outImg = &flowRegA_; }
             dd_->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pFlowReg_.pipeline);
+            boundPipe = pFlowReg_.pipeline;
             dd_->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pFlowReg_.layout, 0, 1, &set, 0, nullptr);
             dd_->CmdDispatch(cmd, (fe.width + 15) / 16, (fe.height + 15) / 16, 1);
             bar(*outImg);
@@ -531,8 +578,10 @@ static bool ensureScratch(FrameGen* fg, const DeviceDispatch* dd, VkDevice dev,
     // C2: flow-reg UBO (params refreshed each frame in record() for hot-reload).
     makeUbo(dd, dev, mp, sizeof(FlowRegUBO), S.flowRegUbo, S.flowRegUboMem, S.flowRegUboPtr);
     if (S.flowRegUboPtr) { FlowRegUBO fu{cfg.frDt, cfg.frLambda, cfg.frEdge, cfg.frEps}; std::memcpy(S.flowRegUboPtr, &fu, sizeof(fu)); }
+    // Only the solved levels need a FlowUBO (of3_flow is never dispatched below
+    // fg->flowFinest()); allocating 7 of them wasted 5 never-bound buffers.
     S.flowUbo.resize(kLevels); S.flowUboMem.resize(kLevels); S.flowUboPtr.resize(kLevels);
-    for (int l = 0; l < kLevels; ++l) {
+    for (int l = fg->flowFinest(); l < kLevels; ++l) {
         makeUbo(dd, dev, mp, sizeof(FlowUBO), S.flowUbo[l], S.flowUboMem[l], S.flowUboPtr[l]);
         if (S.flowUboPtr[l]) { FlowUBO u{cfg.flowScale, (uint32_t)l, 0.6f, 1.6f}; std::memcpy(S.flowUboPtr[l], &u, sizeof(u)); }
     }
@@ -564,10 +613,10 @@ static bool ensureScratch(FrameGen* fg, const DeviceDispatch* dd, VkDevice dev,
     // solved flow levels; prev stays raw. Below kFlowFinest the level is never
     // dispatched, so leaving those at raw curr is harmless.
     S.sFlow.resize(kLevels);
-    for (int l = 0; l < kLevels; ++l) {
+    for (int l = fg->flowFinest(); l < kLevels; ++l) {
         S.sFlow[l] = allocSet(dd, dev, pool, pFlow.setLayout);
         int pred = (l + 1 < kLevels) ? l + 1 : l;
-        VkImageView currLvl = (l >= fg->flowFinest()) ? pyrAs[l].view : pyrA[l].view;
+        VkImageView currLvl = pyrAs[l].view;
         wUbo(dd, dev, S.sFlow[l], 0, S.flowUbo[l], sizeof(FlowUBO));
         wImg(dd, dev, S.sFlow[l], 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pyrB[l].view, samp, GEN);
         wImg(dd, dev, S.sFlow[l], 33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, currLvl, samp, GEN);

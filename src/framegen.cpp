@@ -201,6 +201,11 @@ bool FrameGen::onResize(VkExtent2D extent, VkFormat /*colorFormat*/, bool force)
         VkExtent2D e = levelExtent(extent, l);
         if (!makeImage(pyrA_[l], e, VK_FORMAT_R32_SFLOAT, lumaUsage)) return false;
         if (!makeImage(pyrB_[l], e, VK_FORMAT_R32_SFLOAT, lumaUsage)) return false;
+        // flow is only ever solved for levels >= flowFinest_ (of3_flow is never
+        // dispatched below it), so the finer levels would be pure VRAM waste:
+        // R16G16B16A16 at 1080p is 16.6 MB for level 0 alone, 4.2 MB for level 1.
+        // Leave them VK_NULL_HANDLE; nothing references them.
+        if (l < flowFinest_) continue;
         if (!makeImage(flowLvl_[l], e, VK_FORMAT_R16G16B16A16_SFLOAT, flowUsage)) return false;
     }
     // C1: stabilized curr luma — only the levels the dense flow reads (finest..coarsest).

@@ -838,6 +838,10 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                  presents, en, st->cfg.multiplier, st->fg.valid());
         lastEnabled = en;
     }
+    // Announce once which backend the overlay stats block actually landed on —
+    // "none" means an overlay will not see win-fg fps and WIN_FG_STATS_DIR
+    // should be set (this used to be silent on Android).
+    if (presents == 0) winfg_stats::logOnce();
     ++presents;
     // Publish real-frame accounting to the overlay shared-memory block. One
     // guest present == one real frame (generated-frame accounting is added

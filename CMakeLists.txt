@@ -40,6 +40,42 @@ if(ANDROID)
 endif()
 set_target_properties(win_fg PROPERTIES OUTPUT_NAME win_fg)
 if(ANDROID)
+  # liblog for __android_log_print; libandroid for ASharedMemory_create()
+  # (winfg_stats.hpp uses it in place of the missing Bionic shm_open).
   find_library(log-lib log)
+  find_library(android-lib android)
   target_link_libraries(win_fg ${log-lib})
+  if(android-lib)
+    target_link_libraries(win_fg ${android-lib})
+  endif()
+else()
+  # shm_open()/ftruncate() historically live in librt; glibc >= 2.34 folded them
+  # into libc, but linking rt is harmless and keeps older toolchains working.
+  find_library(rt-lib rt)
+  if(rt-lib)
+    target_link_libraries(win_fg ${rt-lib})
+  endif()
+endif()
+
+# ---- offline harnesses ------------------------------------------------------
+# record_apicount drives FrameGen::record() against a real (or software) Vulkan
+# device and counts the vkCmd* calls plus the exact device memory the per-size
+# scratch set asks for. It never submits anything, so it runs fine on lavapipe
+# and needs no GPU — see the header comment in tests/record_apicount.cpp for why
+# emit-side counts are the honest metric for the record()-path optimizations.
+option(WINFG_BUILD_TESTS "Build the offline verification harnesses" OFF)
+if(WINFG_BUILD_TESTS)
+  find_package(Vulkan QUIET)
+  if(Vulkan_FOUND)
+    add_executable(record_apicount tests/record_apicount.cpp src/framegen.cpp)
+    target_include_directories(record_apicount PRIVATE src ${VULKAN_INCLUDE})
+    # framegen.cpp goes through the dispatch tables only, so it must NOT see the
+    # loader prototypes; the harness itself does need them (it creates the device
+    # and calls vkGetDeviceProcAddr to fill the tables), hence the per-source flag.
+    set_source_files_properties(src/framegen.cpp PROPERTIES
+                                COMPILE_DEFINITIONS VK_NO_PROTOTYPES=1)
+    target_link_libraries(record_apicount Vulkan::Vulkan)
+  else()
+    message(WARNING "WINFG_BUILD_TESTS=ON but no Vulkan loader; skipping harnesses")
+  endif()
 endif()
