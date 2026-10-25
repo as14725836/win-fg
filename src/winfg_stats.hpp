@@ -17,8 +17,14 @@
 //      compiled out under a bare #ifdef __ANDROID__, which killed telemetry on
 //      exactly the platform win-fg targets. ASharedMemory is the Android
 //      replacement (memfd/ashmem backed).
-//   3. desktop: memfd_create() -> anonymous, no filesystem pollution.
-//   4. desktop: shm_open() -> classic POSIX, the one MangoHudfex already scans.
+//   3. posix shm_open() -> the one MangoHudfex actually scans. It opens
+//      "<shmdir>/<name>" by path, so a readable DIRECTORY ENTRY is mandatory.
+//      On glibc shmdir is /dev/shm; the termux glibc build patches SHMDIR to
+//      $PREFIX_CLASSICAL/tmp/ (gpkg/glibc/set-dirs.patch), which is why the
+//      reader also probes those paths. This must be tried BEFORE memfd.
+//   4. desktop: memfd_create() -> anonymous, no filesystem pollution, but it
+//      has NO path: the only handle is /proc/<pid>/fd/<n>, so an out-of-process
+//      overlay cannot find it by scanning a directory. Fallback only.
 //
 // The segment is a single struct with fixed layout (versioned). Counters are
 // plain uint64_t written under the layer's global mutex (the present hook is
@@ -44,7 +50,11 @@
 
 namespace winfg_stats {
 constexpr uint32_t kMagic   = 0x57464753u;  // "WFGS"
-constexpr uint32_t kVersion = 2;            // 1 = desktop-only, dead on Android
+// MUST stay 1. Readers do a strict equality check (MangoHudfex src/winfg.h has
+// `constexpr uint32_t kVersion = 1;` and rejects the segment on any mismatch),
+// and the struct layout below has never changed, so there is nothing a bump
+// would signal. Bumping this to 2 breaks the HUD on every existing overlay.
+constexpr uint32_t kVersion = 1;
 
 // Fixed-layout block shared with the overlay. Keep this ABI stable.
 struct Stats {
@@ -110,22 +120,50 @@ inline int openSegment(const char* name, size_t size, Backend& tag) {
     return -1;   // Bionic has no shm_open; nothing else to try.
 #else
     {
+        // POSIX shm first: it leaves a directory entry under <shmdir>, which is
+        // the ONLY way an out-of-process overlay (MangoHudfex scans the shm dir
+        // for "win-fg-*-stats") can discover the segment. memfd would "succeed"
+        // here just fine but be invisible to it.
+        //
+        // POSIX also requires the leading '/' in the shm name; glibc accepts
+        // both forms, but musl and the name-vs-path logic in some loaders do
+        // not, so normalise here and keep `name` (without slash) for the
+        // file/ASharedMemory backends and for logging.
+        char shm_name[72];
+        std::snprintf(shm_name, sizeof shm_name, "/%s",
+                      name[0] == '/' ? name + 1 : name);
+
+        // Try the standard shm dir, then the termux-glibc patched one. On
+        // termux, SHMDIR is $PREFIX_CLASSICAL/tmp/ (see gpkg/glibc/
+        // set-dirs.patch), so shm_open() creates the entry there — the plain
+        // shm_open call below already lands in the right place; the explicit
+        // fallback only matters when the process runs under a different
+        // prefix than the layer was linked against.
+        int fd = ::shm_open(shm_name, O_RDWR | O_CREAT, 0600);
+        if (fd >= 0) {
+            ::fchmod(fd, 0600);
+            if (::ftruncate(fd, (off_t)size) == 0) {
+                tag = Backend::kShm;
+                WFG_LOGI("stats: publishing via shm_open '%s'", shm_name);
+                return fd;
+            }
+            int saved = errno;
+            ::close(fd);
+            ::shm_unlink(shm_name);
+            errno = saved;
+        }
+        WFG_LOGE("stats: shm_open('%s') failed (errno=%d)", shm_name, errno);
+    }
+    {
+        // Last resort: anonymous memfd. Works, but has no directory entry, so
+        // only an overlay that receives the pid and reads /proc/<pid>/fd can
+        // find it. Better than nothing.
         int fd = (int)::syscall(SYS_memfd_create, name, 0u /* MFD_CLOEXEC */);
         if (fd >= 0) {
             if (::ftruncate(fd, (off_t)size) == 0) {
                 tag = Backend::kMemfd;
-                WFG_LOGI("stats: publishing via memfd '%s' (fd=%d)", name, fd);
-                return fd;
-            }
-            ::close(fd);
-        }
-    }
-    {
-        int fd = ::shm_open(name, O_RDWR | O_CREAT, 0600);
-        if (fd >= 0) {
-            if (::ftruncate(fd, (off_t)size) == 0) {
-                tag = Backend::kShm;
-                WFG_LOGI("stats: publishing via shm_open '%s'", name);
+                WFG_LOGI("stats: publishing via memfd '%s' (fd=%d, no shm dir entry — "
+                         "overlays that scan the shm dir will NOT see this)", name, fd);
                 return fd;
             }
             ::close(fd);
