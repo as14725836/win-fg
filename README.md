@@ -167,10 +167,17 @@ Native these are driven by the host app rather than a file.
 | `fr_dt` | `WIN_FG_FR_DT` | `0.25` | smoothing step (higher ⇒ smoother, risks soft edges) |
 | `fr_edge` | `WIN_FG_FR_EDGE` | `8.0` | luma-gradient edge sensitivity |
 | `fr_eps` | `WIN_FG_FR_EPS` | `0.05` | Charbonnier epsilon (px) |
+| `c4` | `WIN_FG_C4` | `auto` | C4 directional occlusion/edge blend: `auto`\|`on`\|`off` |
+| `c4_occl` | `WIN_FG_C4_OCCL` | `3.0` | visibility falloff vs each candidate's own relative FB disagreement |
+| `c4_edge` | `WIN_FG_C4_EDGE` | `1.5` | local softmax sharpening at luma edges |
+| `c4_edge_lo` | `WIN_FG_C4_EDGE_LO` | `0.04` | centred luma gradient where an edge starts |
+| `c4_edge_hi` | `WIN_FG_C4_EDGE_HI` | `0.16` | ... where it counts as a hard edge |
 | `debug` | `WIN_FG_DEBUG` | `off` | granular per-frame present-path trace to logcat for freeze triage; default off = zero overhead |
 
-Setting `global_motion` or `flow_reg` to `off` makes the chain byte-identical
-to the version without that stage.
+Setting `global_motion`, `flow_reg` or `c4` to `off` makes the chain
+byte-identical to the version without that stage (`c4=off` uploads an
+all-zero C4 tuple, which collapses every C4 expression in `wfg_synth.comp`
+back to its pre-C4 form).
 
 **`pacing` defaults off.** It was defaulted on when it landed, then turned off
 to A/B a flicker regression after live setting changes, and has stayed off
@@ -191,10 +198,11 @@ framegen init ok (queueFamily=N, 10 pipelines, model=M, C1 gm=1, C2 flow_reg=1 i
 framegen resized to 1920x1080 (7 pyramid levels, kFlowFinest=2 perf_preset=1)
 C1 global-motion: engaged=1 mode=0 stable=750 transPx=0.3 (model=4)
 C2 flow-reg: engaged=1 mode=0 iters=4 lambda=2.00 dt=0.25 edge=8.0 eps=0.050
+C4 occl/edge: engaged=1 mode=0 occl=3.00 edge=1.50 lo=0.040 hi=0.160
 ```
 
-C1 prints on every engage-state change and then every 300 frames. **There is
-no periodic rate line** — the log tells you what is *engaged*, never what is
+C1/C2/C4 print on every engage-state change and then every 300 frames. **There
+is no periodic rate line** — the log tells you what is *engaged*, never what is
 being *achieved*; for throughput you need the host's own counter. Adding one
 is an open item.
 

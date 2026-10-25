@@ -48,6 +48,10 @@ layout(binding = 0) uniform U {
     vec4  hudRect;     // pixel coords (x0,y0,x1,y1); disabled when x0>=x1.
                         // fragments inside are written verbatim from uCurr so
                         // HUD/text doesn't get warped by flow (Isygold pattern).
+    // ── C4 occlusion / edge blend ────────────────────────────────────────────
+    // c4 = (occlGain, edgeGain, edgeLo, edgeHi). All zero ⇒ C4 fully OFF and
+    // every value below reduces to the pre-C4 expression exactly.
+    vec4  c4;
 };
 
 layout(binding = 32) uniform sampler2D uPrev;      // I0
@@ -127,6 +131,47 @@ void main() {
     float Z0 = -(photoScale * eA + lambda * (1.0 - consist));
     float Z1 = -(photoScale * eB + lambda * (1.0 - consist));
 
+    // ── C4: directional visibility + edge-local blending ─────────────────────
+    // (all-zero c4 ⇒ visA=visB=1, betaL=beta, gLo/gHi = the pre-C4 constants,
+    //  so every expression below degenerates to the pre-C4 shader.)
+    //
+    // 1) DIRECTIONAL VISIBILITY. `consist` above is a single number shared by
+    //    both candidates, measured at the OUTPUT pixel. That is why an occlusion
+    //    boundary still ghosts: the visible candidate and the occluded one get
+    //    the same penalty, so the softmax averages them and the occluded side's
+    //    stale content shows through at ~50%. C4 instead measures each candidate
+    //    where it ACTUALLY SAMPLED (pA / pB) and only attenuates the one whose
+    //    own fwd/bwd pair disagrees there — the occluded side. The visible side
+    //    keeps full weight and wins the blend outright.
+    //    relA = |F01(x) + F10(x + F01(x))| relative to the claimed magnitude,
+    //    with a 1-texel floor so near-static blocks (pure search noise) do not
+    //    divide by ~0 and read as inconsistent.
+    float visA = 1.0, visB = 1.0, edge = 0.0;
+    const bool c4on = (c4.x > 0.0 || c4.y > 0.0);
+    if (c4on) {
+        vec2 fA  = texture(uFlowBwd, pA).xy * flowScale * invDim;
+        vec2 fAb = texture(uFlowFwd, pA + fA).xy * flowScale * invDim;
+        float relA = length(fA + fAb) / (0.5 * (length(fA) + length(fAb)) + invDim.x);
+
+        vec2 fB  = texture(uFlowFwd, pB).xy * flowScale * invDim;
+        vec2 fBf = texture(uFlowBwd, pB + fB).xy * flowScale * invDim;
+        float relB = length(fB + fBf) / (0.5 * (length(fB) + length(fBf)) + invDim.x);
+
+        visA = exp(-c4.x * relA);
+        visB = exp(-c4.x * relB);
+
+        // 2) EDGE STRENGTH at this output pixel, from the CURRENT frame's luma.
+        //    4-tap central difference: we only need "am I on an edge", not its
+        //    orientation. Halved so a full black->white step reads ~1. Flat
+        //    colour ⇒ 0 ⇒ both edge terms below are exactly the pre-C4 values.
+        vec2 e = invDim;
+        float gx = luma(texture(uCurr, uv + vec2(e.x, 0.0)).rgb)
+                 - luma(texture(uCurr, uv - vec2(e.x, 0.0)).rgb);
+        float gy = luma(texture(uCurr, uv + vec2(0.0, e.y)).rgb)
+                 - luma(texture(uCurr, uv - vec2(0.0, e.y)).rgb);
+        edge = smoothstep(c4.z, c4.w, 0.5 * length(vec2(gx, gy)));
+    }
+
     // ── Softmax importance weights, biased by temporal proximity ──────────────
     // tau: the temporally NEARER source frame is trusted more.
     float tau0 = (1.0 - alpha);
@@ -134,8 +179,12 @@ void main() {
     // shift by max(Z) for numerical stability (translation-invariance, as in the
     // softmax-splatting importance metric).
     float zmax = max(Z0, Z1);
-    float W0 = tau0 * exp(beta * (Z0 - zmax));
-    float W1 = tau1 * exp(beta * (Z1 - zmax));
+    // C4: sharpen the softmax locally at edges. Averaging two candidates across a
+    // luma edge is what softens it; away from edges the gentler weighting is left
+    // alone so noise is not amplified.
+    float betaL = beta * (1.0 + c4.y * edge);
+    float W0 = tau0 * exp(betaL * (Z0 - zmax)) * visA;
+    float W1 = tau1 * exp(betaL * (Z1 - zmax)) * visB;
     float Wsum = W0 + W1;
 
     vec3 warped = (Wsum > 1e-8) ? (W0 * C0 + W1 * C1) / Wsum

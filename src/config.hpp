@@ -3,6 +3,7 @@
 // conf.toml (a config file, when present, wins over the env defaults).
 #pragma once
 #include <cstdint>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -103,6 +104,25 @@ struct Config {
     // the gate can stay closer to the original values now.
     float    epsilon     = 0.07f;  // disocclusion floor (0.05 -> 0.10 -> 0.07)
     float    photoScale  = 7.5f;   // photometric residual scale into Z (6.0 -> 9.0 -> 7.5)
+    // ── C4 OCCLUSION / EDGE BLEND ─────────────────────────────────────────────
+    // The synth blends the two warped candidates with a softmax over a *shared*
+    // confidence term. At an occlusion boundary one candidate is valid and the
+    // other samples content that does not exist in its source frame; averaging
+    // them is the residual "double exposure" ghost. C4 makes the weights
+    // DIRECTIONAL: each candidate is measured with its own forward/backward
+    // disagreement at the point it actually sampled, so the occluded side is
+    // attenuated and the visible side wins instead of averaging into a ghost.
+    // It also sharpens the softmax locally at luma edges (so an edge is not
+    // softened by averaging) and lowers the photometric gate there (a cross-fade
+    // is invisible on flat colour but is exactly the halo we want gone on an
+    // edge). In flat regions nothing changes, so no noise is amplified.
+    // 0 = auto (engaged), 1 = on, 2 = off (byte-identical to pre-C4).
+    // WIN_FG_C4=auto|on|off  /  conf.toml c4=auto|on|off.
+    int      c4Mode      = 0;      // 0 auto (engaged), 1 on, 2 off
+    float    occlGain    = 3.0f;   // visibility falloff vs relative FB disagreement
+    float    edgeGain    = 1.5f;   // local softmax sharpening at luma edges
+    float    edgeLo      = 0.04f;  // luma gradient (0..1) where an edge starts
+    float    edgeHi      = 0.16f;  // ... and where it counts as a hard edge
     // HUD exclusion rect in pixel coords (x0,y0,x1,y1). Fragments inside are
     // passed through as the real current frame (no warp, no synth) so text /
     // overlays don't ghost. Disabled when x0 >= x1 or y0 >= y1 (the default).
@@ -156,6 +176,13 @@ struct Config {
         if (frDt < 0.01f) frDt = 0.01f; if (frDt > 4.0f) frDt = 4.0f;
         if (frEdge < 0.0f) frEdge = 0.0f;
         if (frEps < 1e-3f) frEps = 1e-3f;
+        if (c4Mode < 0) c4Mode = 0; if (c4Mode > 2) c4Mode = 2;
+        if (occlGain < 0.0f) occlGain = 0.0f; if (occlGain > 64.0f) occlGain = 64.0f;
+        if (edgeGain < 0.0f) edgeGain = 0.0f; if (edgeGain > 64.0f) edgeGain = 64.0f;
+        if (edgeLo < 0.0f) edgeLo = 0.0f; if (edgeLo > 1.0f) edgeLo = 1.0f;
+        if (edgeHi < 0.0f) edgeHi = 0.0f; if (edgeHi > 1.0f) edgeHi = 1.0f;
+        // edgeHi must stay above edgeLo or the smoothstep degenerates.
+        if (edgeHi < edgeLo + 1e-4f) edgeHi = edgeLo + 1e-4f;
         if (flowScale < 0.05f) flowScale = 0.05f; if (flowScale > 4.0f) flowScale = 4.0f;
         if (beta < 0.0f) beta = 0.0f; if (lambda < 0.0f) lambda = 0.0f;
         // capture knobs
@@ -224,6 +251,11 @@ static inline void apply_toml(Config& c, const std::string& path) {
         else if (k == "fr_dt")      c.frDt = std::strtof(v.c_str(), nullptr);
         else if (k == "fr_edge")    c.frEdge = std::strtof(v.c_str(), nullptr);
         else if (k == "fr_eps")     c.frEps = std::strtof(v.c_str(), nullptr);
+        else if (k == "c4")         c.c4Mode = parse_tristate(v, c.c4Mode);
+        else if (k == "c4_occl")    c.occlGain = std::strtof(v.c_str(), nullptr);
+        else if (k == "c4_edge")    c.edgeGain = std::strtof(v.c_str(), nullptr);
+        else if (k == "c4_edge_lo") c.edgeLo = std::strtof(v.c_str(), nullptr);
+        else if (k == "c4_edge_hi") c.edgeHi = std::strtof(v.c_str(), nullptr);
         else if (k == "flowScale")  c.flowScale = std::strtof(v.c_str(), nullptr);
         else if (k == "beta")       c.beta = std::strtof(v.c_str(), nullptr);
         else if (k == "lambda")     c.lambda = std::strtof(v.c_str(), nullptr);
@@ -287,6 +319,11 @@ static inline Config load_config() {
     c.frDt       = envf("WIN_FG_FR_DT", c.frDt);
     c.frEdge     = envf("WIN_FG_FR_EDGE", c.frEdge);
     c.frEps      = envf("WIN_FG_FR_EPS", c.frEps);
+    if (const char* c4 = std::getenv("WIN_FG_C4")) c.c4Mode = parse_tristate(c4, c.c4Mode);
+    c.occlGain   = envf("WIN_FG_C4_OCCL", c.occlGain);
+    c.edgeGain   = envf("WIN_FG_C4_EDGE", c.edgeGain);
+    c.edgeLo     = envf("WIN_FG_C4_EDGE_LO", c.edgeLo);
+    c.edgeHi     = envf("WIN_FG_C4_EDGE_HI", c.edgeHi);
     c.flowScale  = envf("WIN_FG_FLOWSCALE", c.flowScale);
     c.beta       = envf("WIN_FG_BETA", c.beta);
     c.lambda     = envf("WIN_FG_LAMBDA", c.lambda);
@@ -324,10 +361,20 @@ static inline Config load_config() {
 // UBO layout — MUST match wfg_synth.comp binding 0.
 // The vec4 hudRect is 16-byte aligned in std140, sits at offset 32 (after the
 // 8 leading floats which naturally occupy 32B). Disabled when hudX0>=hudX1.
+// c4 sits at offset 48 (16-byte aligned): occlGain, edgeGain, edgeLo, edgeHi.
+// All four zero ⇒ C4 off ⇒ bit-identical to the pre-C4 shader.
 struct SynthUBO {
     float flowScale, alpha, beta, lambda, epsilon, photoScale, pad0, pad1;
     float hudX0, hudY0, hudX1, hudY1;
+    float c4OcclGain, c4EdgeGain, c4EdgeLo, c4EdgeHi;
 };
+// std140 layout guard: 6 scalars + 2 pads = 32 B, hudRect = 16 B, c4 = 16 B.
+// If the GLSL block in wfg_synth.comp ever diverges from this C++ mirror the
+// UBO upload silently corrupts unrelated parameters — fail at compile time.
+static_assert(sizeof(float) == 4, "float must be 32-bit");
+static_assert(offsetof(SynthUBO, hudX0) == 32, "SynthUBO hudRect must start at 32");
+static_assert(offsetof(SynthUBO, c4OcclGain) == 48, "SynthUBO c4 must start at 48");
+static_assert(sizeof(SynthUBO) == 64, "SynthUBO must be 64 B (std140 match)");
 // UBO layout — MUST match of3_flow / of3_expand_m4 binding 0 (Model3UBO).
 struct FlowUBO { float flowScale; uint32_t level; float occlLo; float occlHi; };
 

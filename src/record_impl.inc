@@ -354,8 +354,17 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     }
 
     // update UBOs for this frame
+    // C4: c4Mode==2 ("off") hands the synth a zeroed tuple, which makes every C4
+    // expression in wfg_synth.comp collapse to its pre-C4 form (visA=visB=1,
+    // betaL=beta) — i.e. an off switch that is byte-identical to 0.3.1 behaviour
+    // without needing a second shader. Any other mode passes the live gains.
+    const bool c4off = (cfg_.c4Mode == 2);
     SynthUBO su{cfg_.flowScale, alpha, cfg_.beta, cfg_.lambda, cfg_.epsilon, cfg_.photoScale, 0, 0,
-                cfg_.hudX0, cfg_.hudY0, cfg_.hudX1, cfg_.hudY1};
+                cfg_.hudX0, cfg_.hudY0, cfg_.hudX1, cfg_.hudY1,
+                c4off ? 0.0f : cfg_.occlGain,
+                c4off ? 0.0f : cfg_.edgeGain,
+                c4off ? 0.0f : cfg_.edgeLo,
+                c4off ? 0.0f : cfg_.edgeHi};
     if (g_scratch.synthUboPtr) std::memcpy(g_scratch.synthUboPtr, &su, sizeof(su));
 
     // wire per-frame external views
@@ -545,6 +554,15 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
             WFG_LOGI("C2 flow-reg: engaged=%d mode=%d iters=%d lambda=%.2f dt=%.2f edge=%.1f eps=%.3f (model=%d)",
                      fe, cfg_.frMode, cfg_.frIters, cfg_.frLambda, cfg_.frDt, cfg_.frEdge, cfg_.frEps, cfg_.model);
             lastFr = fe;
+        }
+    }
+    {   // periodic C4 status (tag win-fg), mirrors the C1/C2 log cadence
+        static int lastC4 = -1;
+        int c4e = (cfg_.c4Mode == 2) ? 0 : 1;
+        if (c4e != lastC4 || (gmFrames_ % 300ull) == 0) {
+            WFG_LOGI("C4 occl/edge: engaged=%d mode=%d occl=%.2f edge=%.2f lo=%.3f hi=%.3f (model=%d)",
+                     c4e, cfg_.c4Mode, cfg_.occlGain, cfg_.edgeGain, cfg_.edgeLo, cfg_.edgeHi, cfg_.model);
+            lastC4 = c4e;
         }
     }
 
